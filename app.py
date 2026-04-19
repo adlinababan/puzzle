@@ -1,286 +1,150 @@
 import cv2
+import mediapipe as mp
+import numpy as np
 import time
 import random
-import numpy as np
-import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+
+# INIT
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=2)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0)
+
+captured = False
+puzzle_ready = False
+
+GRID = 3
+TILE = 100
+
+tiles = []
+order = []
+blank_idx = None
 
 # =========================
-# CONFIG
+# HELPER
 # =========================
-GRID_SIZE = 3
-TILE_SIZE = 120
-BOARD_SIZE = GRID_SIZE * TILE_SIZE
+def distance(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
 
-st.set_page_config(page_title="Your Face Puzzle", layout="centered")
+def split_tiles(img):
+    img = cv2.resize(img, (GRID*TILE, GRID*TILE))
+    t = []
+    for r in range(GRID):
+        for c in range(GRID):
+            t.append(img[r*TILE:(r+1)*TILE, c*TILE:(c+1)*TILE])
+    return t
 
-# =========================
-# SESSION STATE
-# =========================
-if "captured_image" not in st.session_state:
-    st.session_state.captured_image = None
+def shuffle_tiles():
+    global order, blank_idx
+    order = list(range(GRID*GRID))
+    blank_idx = len(order) - 1
 
-if "tiles" not in st.session_state:
-    st.session_state.tiles = None
-
-if "blank_idx" not in st.session_state:
-    st.session_state.blank_idx = None
-
-if "solved_tiles" not in st.session_state:
-    st.session_state.solved_tiles = None
-
-if "started" not in st.session_state:
-    st.session_state.started = False
-
-if "start_time" not in st.session_state:
-    st.session_state.start_time = None
-
-if "finished" not in st.session_state:
-    st.session_state.finished = False
-
-if "moves" not in st.session_state:
-    st.session_state.moves = 0
-
-
-# =========================
-# HELPERS
-# =========================
-def crop_center_square(img: np.ndarray) -> np.ndarray:
-    """Crop image to center square."""
-    h, w = img.shape[:2]
-    side = min(h, w)
-    x = (w - side) // 2
-    y = (h - side) // 2
-    return img[y:y+side, x:x+side]
-
-
-def prepare_face_image(img: np.ndarray) -> np.ndarray:
-    """
-    Resize image to board size.
-    Input img expected in BGR from OpenCV.
-    """
-    img = crop_center_square(img)
-    img = cv2.resize(img, (BOARD_SIZE, BOARD_SIZE))
-    return img
-
-
-def split_into_tiles(img: np.ndarray):
-    """Split image into GRID_SIZE x GRID_SIZE tiles."""
-    tiles = []
-    for r in range(GRID_SIZE):
-        for c in range(GRID_SIZE):
-            y1 = r * TILE_SIZE
-            y2 = y1 + TILE_SIZE
-            x1 = c * TILE_SIZE
-            x2 = x1 + TILE_SIZE
-            tile = img[y1:y2, x1:x2].copy()
-            tiles.append(tile)
-    return tiles
-
-
-def get_solved_order():
-    return list(range(GRID_SIZE * GRID_SIZE))
-
+    for _ in range(100):
+        neighbors = get_neighbors(blank_idx)
+        swap = random.choice(neighbors)
+        order[blank_idx], order[swap] = order[swap], order[blank_idx]
+        blank_idx = swap
 
 def get_neighbors(idx):
-    r, c = divmod(idx, GRID_SIZE)
-    neighbors = []
-    if r > 0:
-        neighbors.append((r - 1) * GRID_SIZE + c)
-    if r < GRID_SIZE - 1:
-        neighbors.append((r + 1) * GRID_SIZE + c)
-    if c > 0:
-        neighbors.append(r * GRID_SIZE + (c - 1))
-    if c < GRID_SIZE - 1:
-        neighbors.append(r * GRID_SIZE + (c + 1))
-    return neighbors
+    r, c = divmod(idx, GRID)
+    n = []
+    if r > 0: n.append((r-1)*GRID + c)
+    if r < GRID-1: n.append((r+1)*GRID + c)
+    if c > 0: n.append(r*GRID + c-1)
+    if c < GRID-1: n.append(r*GRID + c+1)
+    return n
 
-
-def shuffle_safely(order, steps=150):
-    """
-    Shuffle by doing valid blank moves, so the puzzle is always solvable.
-    Blank tile is last tile.
-    """
-    current = order.copy()
-    blank = len(current) - 1
-
-    for _ in range(steps):
-        neighbors = get_neighbors(blank)
-        swap_idx = random.choice(neighbors)
-        current[blank], current[swap_idx] = current[swap_idx], current[blank]
-        blank = swap_idx
-
-    return current, blank
-
-
-def create_blank_tile():
-    tile = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.uint8)
-    tile[:] = (20, 20, 20)
-    cv2.rectangle(tile, (0, 0), (TILE_SIZE - 1, TILE_SIZE - 1), (120, 120, 120), 2)
-    return tile
-
-
-def render_board(tile_order, original_tiles):
-    """
-    Render board image based on current order.
-    tile_order contains tile indexes, with last index treated as blank.
-    """
-    canvas = np.zeros((BOARD_SIZE, BOARD_SIZE, 3), dtype=np.uint8)
-    blank_tile_idx = GRID_SIZE * GRID_SIZE - 1
-
-    for board_pos, tile_idx in enumerate(tile_order):
-        r, c = divmod(board_pos, GRID_SIZE)
-        y1 = r * TILE_SIZE
-        y2 = y1 + TILE_SIZE
-        x1 = c * TILE_SIZE
-        x2 = x1 + TILE_SIZE
-
-        if tile_idx == blank_tile_idx:
-            tile = create_blank_tile()
+def draw_puzzle(frame):
+    canvas = np.zeros((GRID*TILE, GRID*TILE, 3), dtype=np.uint8)
+    for i, t_idx in enumerate(order):
+        r, c = divmod(i, GRID)
+        if t_idx == GRID*GRID-1:
+            tile = np.zeros((TILE, TILE, 3), dtype=np.uint8)
         else:
-            tile = original_tiles[tile_idx]
+            tile = tiles[t_idx]
 
-        # border
-        tile_copy = tile.copy()
-        cv2.rectangle(tile_copy, (0, 0), (TILE_SIZE - 1, TILE_SIZE - 1), (255, 255, 255), 1)
+        canvas[r*TILE:(r+1)*TILE, c*TILE:(c+1)*TILE] = tile
 
-        canvas[y1:y2, x1:x2] = tile_copy
-
-    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-
-
-def is_solved(tile_order):
-    return tile_order == get_solved_order()
-
-
-def move_tile(clicked_idx):
-    """
-    clicked_idx is board position.
-    Swap if adjacent to blank.
-    """
-    blank = st.session_state.blank_idx
-    if clicked_idx in get_neighbors(blank):
-        order = st.session_state.tiles
-        order[clicked_idx], order[blank] = order[blank], order[clicked_idx]
-        st.session_state.blank_idx = clicked_idx
-        st.session_state.moves += 1
-
-        if is_solved(order):
-            st.session_state.finished = True
-
-
-def init_game_from_image(img_bgr):
-    prepared = prepare_face_image(img_bgr)
-    original_tiles = split_into_tiles(prepared)
-
-    solved_order = get_solved_order()
-    shuffled_order, blank_idx = shuffle_safely(solved_order, steps=150)
-
-    st.session_state.captured_image = prepared
-    st.session_state.solved_tiles = original_tiles
-    st.session_state.tiles = shuffled_order
-    st.session_state.blank_idx = blank_idx
-    st.session_state.started = True
-    st.session_state.start_time = time.time()
-    st.session_state.finished = False
-    st.session_state.moves = 0
-
-
-def reset_game():
-    st.session_state.captured_image = None
-    st.session_state.tiles = None
-    st.session_state.blank_idx = None
-    st.session_state.solved_tiles = None
-    st.session_state.started = False
-    st.session_state.start_time = None
-    st.session_state.finished = False
-    st.session_state.moves = 0
-
+    cv2.imshow("PUZZLE", canvas)
 
 # =========================
-# UI
+# MAIN LOOP
 # =========================
-st.markdown(
-    """
-    <h1 style='text-align:center; color:#00e5ff;'>YOUR FACE PUZZLE</h1>
-    <p style='text-align:center;'>Ambil foto wajahmu lalu susun puzzlenya secepat mungkin.</p>
-    """,
-    unsafe_allow_html=True
-)
+start_capture_time = None
 
-menu = st.radio("Mode", ["Single Player"], horizontal=True)
+while True:
+    ret, frame = cap.read()
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
 
-st.markdown("### 1) Ambil Foto Wajah")
-camera_image = st.camera_input("Aktifkan kamera lalu ambil foto")
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb)
 
-col_a, col_b = st.columns(2)
+    points = []
 
-with col_a:
-    if st.button("Mulai Game", use_container_width=True):
-        if camera_image is None:
-            st.warning("Silakan ambil foto dulu.")
-        else:
-            file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
-            img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            init_game_from_image(img_bgr)
-            st.success("Game dimulai!")
+    if result.multi_hand_landmarks:
+        for hand in result.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
-with col_b:
-    if st.button("Reset", use_container_width=True):
-        reset_game()
-        st.rerun()
+            # ambil titik jempol & telunjuk
+            thumb = hand.landmark[4]
+            index = hand.landmark[8]
 
-st.markdown("---")
+            tx, ty = int(thumb.x * w), int(thumb.y * h)
+            ix, iy = int(index.x * w), int(index.y * h)
 
-if st.session_state.started and st.session_state.captured_image is not None:
-    elapsed = int(time.time() - st.session_state.start_time) if not st.session_state.finished else int(time.time() - st.session_state.start_time)
+            cv2.circle(frame, (tx, ty), 8, (0,255,255), -1)
+            cv2.circle(frame, (ix, iy), 8, (0,255,255), -1)
 
-    m, s = divmod(elapsed, 60)
-    st.markdown(f"### ⏱️ Waktu: {m:02d}:{s:02d}")
-    st.markdown(f"### 🎯 Moves: {st.session_state.moves}")
+            points.append((tx, ty))
+            points.append((ix, iy))
 
-    board_img = render_board(st.session_state.tiles, st.session_state.solved_tiles)
-    st.image(board_img, caption="Klik nomor posisi di bawah untuk menggeser ubin", use_container_width=False)
+    # =========================
+    # BUAT KOTAK (2 tangan)
+    # =========================
+    if len(points) >= 4:
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
 
-    st.markdown("### 2) Geser Puzzle")
-    st.caption("Klik posisi ubin yang ingin dipindah. Hanya ubin di sebelah kotak kosong yang bisa bergerak.")
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
 
-    for r in range(GRID_SIZE):
-        cols = st.columns(GRID_SIZE)
-        for c in range(GRID_SIZE):
-            idx = r * GRID_SIZE + c
-            tile_value = st.session_state.tiles[idx]
-            label = "⬜" if tile_value == GRID_SIZE * GRID_SIZE - 1 else f"{tile_value + 1}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255,255,255), 2)
 
-            with cols[c]:
-                if st.button(label, key=f"btn_{idx}", use_container_width=True):
-                    if not st.session_state.finished:
-                        move_tile(idx)
-                        st.rerun()
+        # =========================
+        # DETEKSI JENTIK (PINCH)
+        # =========================
+        if len(points) >= 4:
+            d = distance(points[0], points[1])  # jempol-index
 
-    st.markdown("---")
-    st.markdown("### 3) Preview Gambar Asli")
-    st.image(
-        cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB),
-        caption="Gambar asli",
-        use_container_width=False
-    )
+            if d < 40:
+                if start_capture_time is None:
+                    start_capture_time = time.time()
 
-    if st.session_state.finished:
-        total_time = int(time.time() - st.session_state.start_time)
-        mm, ss = divmod(total_time, 60)
-        st.success(f"🎉 Selamat! Puzzle selesai dalam {mm:02d}:{ss:02d} dengan {st.session_state.moves} moves.")
+                # tahan 1 detik
+                if time.time() - start_capture_time > 1 and not captured:
+                    face = frame[y1:y2, x1:x2]
 
-else:
-    st.info("Ambil foto terlebih dahulu, lalu tekan **Mulai Game**.")
+                    if face.size > 0:
+                        tiles = split_tiles(face)
+                        shuffle_tiles()
+                        captured = True
+                        puzzle_ready = True
+                        print("Captured!")
+            else:
+                start_capture_time = None
 
-st.markdown("---")
-st.markdown(
-    """
-    **Aturan singkat:**
-    - Ambil foto wajah dari kamera
-    - Sistem akan memotong gambar menjadi puzzle 3x3
-    - Susun kembali sampai benar
-    - Ubin hanya bisa bergerak ke kotak kosong
-    """
-)
+    cv2.putText(frame, "Pinch (jempol + telunjuk) untuk capture", (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+    cv2.imshow("CAMERA", frame)
+
+    if puzzle_ready:
+        draw_puzzle(frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
